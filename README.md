@@ -1,36 +1,17 @@
-# 📄 glados_worker_sign_in  
-建立在 Cloudflare worker 的 glados 自动签到，成功将发送通知到 Telegram
+# glados_worker_sign_in
+基于 Cloudflare Workers 的 GLaDOS 自动签到：支持多账号、网页查看状态、手动触发与定时任务；可选 Telegram 通知推送。
 
-[glados 注册地址](https://glados.cloud) 
+![预览](glados.jpg)
 
-签到页地址已变更：`https://glados.cloud/console/checkin`
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/Lxi0707/glados_worker/blob/main/glados.jpg">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/Lxi0707/glados_worker/blob/main/glados.jpg">
-  <img alt="自定义图片" src="https://github.com/Lxi0707/glados_worker/blob/main/glados.jpg">
-</picture>
-
-
-👇👇👇
-# 基于 [仓库](https://github.com/hailang3014/glados-auto) 进行的修改，原仓库通知使用 pushplus 通知
-
-删除了原先的 sendNotification ，新增 sendTelegramNotification 
-
-更新 handleCheckin
-
-## 2025.4.10更新，解决 bot 未知账号: 失败 - statusData.data.leftDays.split is not a function
-
-更换tg变量名,原变量已更换：
-
-```
-TELEGRAM_BOT_TOKEN
-
-TELEGRAM_CHAT_ID
-```
+- 控制台签到页：https://glados.cloud/console/checkin
+- 项目/注册地址参考（实时更新）：https://github.com/glados-network/GLaDOS
 
 ## 功能
-全自动签到，无需服务器，Web 页面，多账号签到任务，签到结果通过 Telegram 推送，每日自动签到，确保不断签，支持手动签到任务
+- 定时自动签到（Cron）
+- 网页查看上次签到与账号状态
+- 手动签到（打开 Worker 页面点击“手动签到”）
+- 多账号（`GLADOS_COOKIE` 使用 `&` 分隔）
+- Telegram 通知（可选）
 
 ## 邀请注册（可选）
 1. 直接注册 GLaDOS（注册地址在 https://github.com/glados-network/GLaDOS 实时更新）
@@ -42,27 +23,24 @@ TELEGRAM_CHAT_ID
 3. 通过 https://zm2wo-iqvg8-s935s-pe0h6.glados.space , 自动填写激活
 
 
-## 📢📢部署步骤
+## 部署步骤
 
-### 1. 登录 Cloudflare Dashboardrd
-注册登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)
-配置 Cloudflare Workers
-创建一个新的 Worker
-将本项目 worker.js 文件内容复制到 Worker 脚本编辑器中
+### 1. 创建 Worker
+登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，创建一个新的 Worker，并将 `worker.js` 内容粘贴到脚本编辑器中。
 
-### 2. 创建 KV 命名空间 并进行绑定
+### 2. 创建 KV 命名空间并绑定
 ```
-# 在 Workers & Pages -> KV 中创建新的命名空间
-命名空间名称：GLADOS_KV
+# 在 Workers & Pages -> KV 中创建命名空间
+GLADOS_KV
 ```
 
 ### 3. 配置环境变量
-在 Worker 的 Settings -> Variables 中添加以下环境变量：
+在 Worker 的 Settings -> Variables 中添加变量（建议敏感信息使用 Secret）：
 
 ```
 GLADOS_COOKIE=你的GLaDOS Cookie
 
-GLADOS_CHECKIN_TOKEN=glados.cloud  # 可选；默认会自动尝试 glados.cloud / glados.one 等
+GLADOS_CHECKIN_TOKEN=glados.cloud  # 可选；不填则默认优先使用 glados.cloud
 
 TELEGRAM_BOT_TOKEN=你的Telegram Bot Token
 
@@ -70,15 +48,13 @@ TELEGRAM_CHAT_ID=你的Telegram 用户ID
 ```
 
 注意：
-如果有多个账号，使用 & 分隔多个 Cookie，例如：cookie1&cookie2&cookie3
+如果有多个账号，使用 `&` 分隔多个 Cookie，例如：`cookie1&cookie2&cookie3`
 
-cookie 自行抓包，这里不做教程
+Cookie 请自行抓包获取，格式示例：
+`koa:sess=...; koa:sess.sig=...`
 
 
 ### 4. 在 Worker 的 Triggers 中添加 Cron 触发器：
 ```
 30 1 * * *    # UTC 1:30 (北京时间 9:30)
 ```
-
-
-
