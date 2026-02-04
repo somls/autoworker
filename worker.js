@@ -1,11 +1,23 @@
 // KV命名空间：GLADOS_KV
 // 必需环境变量：
 // - GLADOS_COOKIE：多个账号cookie用'&'分隔
+// 可选环境变量（积分兑换）：
+// - GLADOS_EXCHANGE_PLAN：100/200/500；不填则不兑换
+// - GLADOS_EXCHANGE_COOLDOWN_HOURS：兑换冷却时间（小时），默认 240（10天）
+// - GLADOS_EXCHANGE_ENDPOINTS：兑换接口路径候选（逗号分隔），默认 /api/user/exchange
+// - GLADOS_EXCHANGE_VERIFY：兑换后是否拉取 status 校验，默认 true
 // 可选环境变量（用于Telegram通知）：
 // - TELEGRAM_BOT_TOKEN
 // - TELEGRAM_CHAT_ID
 
 const GLADOS_BASE_URL = "https://glados.cloud";
+
+const EXCHANGE_PLANS = {
+  100: { planType: "plan100", requiredPoints: 100, addedDays: 10 },
+  200: { planType: "plan200", requiredPoints: 200, addedDays: 30 },
+  // 对齐 Devilstore/Gladoscheckin：plan500 兑换 100 天
+  500: { planType: "plan500", requiredPoints: 500, addedDays: 100 }
+};
 
 function getCheckinTokens(env) {
   const configured = (env.GLADOS_CHECKIN_TOKEN || "").trim();
@@ -23,6 +35,258 @@ function isCheckinSuccess(checkinData) {
   const msg = (checkinData && (checkinData.message || checkinData.msg)) || "";
   if (checkinData && checkinData.code === 0) return true;
   return typeof msg === "string" && msg.toLowerCase().includes("checkin");
+}
+
+function parseBoolean(value, defaultValue) {
+  if (value === undefined || value === null) return defaultValue;
+  const v = String(value).trim().toLowerCase();
+  if (!v) return defaultValue;
+  if (["1", "true", "yes", "y", "on"].includes(v)) return true;
+  if (["0", "false", "no", "n", "off"].includes(v)) return false;
+  return defaultValue;
+}
+
+function parseNumber(value, defaultValue) {
+  if (value === undefined || value === null) return defaultValue;
+  const v = Number(String(value).trim());
+  return Number.isFinite(v) ? v : defaultValue;
+}
+
+function nowChinaString() {
+  return new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+}
+
+function getExchangePlan(env) {
+  const raw = String(env.GLADOS_EXCHANGE_PLAN || "").trim();
+  if (!raw) return null;
+  const v = raw.toLowerCase();
+  if (["off", "false", "0", "none", "disable", "disabled"].includes(v)) return null;
+  const n = parseNumber(v, null);
+  if (![100, 200, 500].includes(n)) return null;
+  const cfg = EXCHANGE_PLANS[String(n)];
+  if (!cfg) return null;
+  return { plan: String(n), ...cfg };
+}
+
+function getExchangeCooldownHours(env) {
+  // 默认冷却 10 天
+  return Math.max(0, parseNumber(env.GLADOS_EXCHANGE_COOLDOWN_HOURS, 24 * 10));
+}
+
+function getExchangeEndpoints(env) {
+  const raw = String(env.GLADOS_EXCHANGE_ENDPOINTS || "").trim();
+  if (raw) {
+    return raw
+      .split(",")
+      .map(function(s) { return s.trim(); })
+      .filter(Boolean)
+      .map(function(p) { return p.startsWith("/") ? p : "/" + p; });
+  }
+  // 对齐 Devilstore/Gladoscheckin：默认兑换接口为 /api/user/exchange
+  return ["/api/user/exchange"];
+}
+
+async function sha256Hex(input) {
+  const data = new TextEncoder().encode(String(input));
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest))
+    .map(function(b) { return b.toString(16).padStart(2, "0"); })
+    .join("");
+}
+
+async function getAccountIdFromCookie(cookie) {
+  const hex = await sha256Hex(cookie);
+  return hex.slice(0, 16);
+}
+
+function parseStatusData(statusData) {
+  const data = statusData && statusData.data ? statusData.data : {};
+  return {
+    email: data.email || "未知账号",
+    points: data.points,
+    leftDays: data.leftDays
+  };
+}
+
+async function fetchJsonSafe(url, init) {
+  const res = await fetch(url, init);
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  return { ok: res.ok, status: res.status, data: data, text: text };
+}
+
+function pickMessageFromApi(data, fallback) {
+  if (!data) return fallback;
+  const msg = data.message || data.msg;
+  return msg ? String(msg) : fallback;
+}
+
+async function fetchStatus(baseUrl, headers) {
+  const statusData = await fetchJson(`${baseUrl}/api/user/status`, { headers: headers });
+  return parseStatusData(statusData);
+}
+
+async function fetchPoints(baseUrl, headers) {
+  const pointsData = await fetchJson(`${baseUrl}/api/user/points`, { headers: headers });
+  const raw = (pointsData && pointsData.points !== undefined) ? pointsData.points : null;
+  const points = parseNumber(raw, null);
+  return Number.isFinite(points) ? points : null;
+}
+
+function verifyExchangeByStatus(beforeStatus, afterStatus, plan) {
+  const beforePoints = Number(beforeStatus && beforeStatus.points);
+  const afterPoints = Number(afterStatus && afterStatus.points);
+  const beforeLeftDays = Number(beforeStatus && beforeStatus.leftDays);
+  const afterLeftDays = Number(afterStatus && afterStatus.leftDays);
+
+  const pointsSpentOk =
+    Number.isFinite(beforePoints) &&
+    Number.isFinite(afterPoints) &&
+    (beforePoints - afterPoints) >= plan.requiredPoints;
+
+  const leftDaysAddedOk =
+    Number.isFinite(beforeLeftDays) &&
+    Number.isFinite(afterLeftDays) &&
+    (afterLeftDays - beforeLeftDays) >= plan.addedDays;
+
+  return pointsSpentOk || leftDaysAddedOk;
+}
+
+async function maybeExchangePoints(env, baseUrl, headers, accountId, beforeStatus) {
+  const plan = getExchangePlan(env);
+  if (!plan) return null;
+
+  let points = Number(beforeStatus && beforeStatus.points);
+  if (!Number.isFinite(points)) {
+    const p = await fetchPoints(baseUrl, headers);
+    if (Number.isFinite(p)) points = p;
+  }
+  if (!Number.isFinite(points)) return { enabled: true, attempted: false, plan: plan.plan, skippedReason: "无法获取积分" };
+  if (points < plan.requiredPoints) {
+    return {
+      enabled: true,
+      attempted: false,
+      plan: plan.plan,
+      skippedReason: `积分不足（当前${points}，需要${plan.requiredPoints}）`
+    };
+  }
+
+  const cooldownHours = getExchangeCooldownHours(env);
+  const key = `exchange:last:${accountId}`;
+  const stored = await env.GLADOS_KV.get(key);
+  let record = null;
+  try {
+    record = stored ? JSON.parse(stored) : null;
+  } catch {
+    record = null;
+  }
+  if (cooldownHours > 0 && record && record.lastAttemptAt) {
+    const lastAttempt = Date.parse(record.lastAttemptAt);
+    const now = Date.now();
+    if (Number.isFinite(lastAttempt) && (now - lastAttempt) < cooldownHours * 3600 * 1000) {
+      return {
+        enabled: true,
+        attempted: false,
+        plan: plan.plan,
+        skippedReason: `冷却中（上次尝试：${record.lastAttemptAt}）`
+      };
+    }
+  }
+
+  const endpoints = getExchangeEndpoints(env);
+  const verify = parseBoolean(env.GLADOS_EXCHANGE_VERIFY, true);
+  // 对齐 Devilstore/Gladoscheckin：payload 使用 planType
+  const payload = { planType: plan.planType };
+
+  let lastError = null;
+  let lastApiMessage = null;
+
+  for (const path of endpoints) {
+    const url = `${baseUrl}${path}`;
+    try {
+      const resp = await fetchJsonSafe(url, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(payload)
+      });
+      lastApiMessage = pickMessageFromApi(resp.data, resp.text || `HTTP ${resp.status}`);
+
+      if (!resp.ok) {
+        lastError = new Error(lastApiMessage);
+        continue;
+      }
+
+      // 兑换属于“有副作用”的操作：只要请求返回 2xx，就不要再继续尝试其它 endpoint，
+      // 避免因“验证失败/延迟”导致重复扣积分/重复兑换。
+      let afterStatus = null;
+      let verified = false;
+      if (verify) {
+        try {
+          afterStatus = await fetchStatus(baseUrl, headers);
+          verified = verifyExchangeByStatus(beforeStatus, afterStatus, plan);
+        } catch (e) {
+          lastError = e;
+          verified = false;
+        }
+      }
+
+      const apiSaysSuccess = resp.data && resp.data.code === 0;
+      const success = verified || apiSaysSuccess;
+      const time = nowChinaString();
+
+      const recordToStore = {
+        lastAttemptAt: new Date().toISOString(),
+        lastSuccessAt: success ? new Date().toISOString() : (record && record.lastSuccessAt ? record.lastSuccessAt : null),
+        plan: plan.plan,
+        endpoint: path,
+        message: lastApiMessage
+      };
+      await env.GLADOS_KV.put(key, JSON.stringify(recordToStore));
+
+      return {
+        enabled: true,
+        attempted: true,
+        plan: plan.plan,
+        requiredPoints: plan.requiredPoints,
+        addedDays: plan.addedDays,
+        success: success,
+        message: success
+          ? (lastApiMessage || "兑换成功")
+          : (verify ? (lastApiMessage || "兑换请求已发送，但验证失败") : (lastApiMessage || "兑换失败")),
+        time: time,
+        endpoint: path,
+        afterStatus: success ? (afterStatus || null) : null
+      };
+    } catch (e) {
+      lastError = e;
+    }
+  }
+
+  const failAt = nowChinaString();
+  const failRecord = {
+    lastAttemptAt: new Date().toISOString(),
+    lastSuccessAt: record && record.lastSuccessAt ? record.lastSuccessAt : null,
+    plan: plan.plan,
+    endpoint: null,
+    message: (lastError && lastError.message) ? lastError.message : (lastApiMessage || "兑换失败")
+  };
+  await env.GLADOS_KV.put(key, JSON.stringify(failRecord));
+
+  return {
+    enabled: true,
+    attempted: true,
+    plan: plan.plan,
+    requiredPoints: plan.requiredPoints,
+    addedDays: plan.addedDays,
+    success: false,
+    message: failRecord.message,
+    time: failAt
+  };
 }
 
 async function fetchJson(url, init) {
@@ -204,6 +468,15 @@ async function handleRequest(env) {
     statusText = allSuccess ? "全部成功" : "部分失败";
     
     accountsHtml = results.map(function(r) {
+      const exchangeHtml = r.exchange && r.exchange.enabled ? `
+        <div class="text-sm text-gray-500 mt-1">
+          积分兑换(${r.exchange.plan}): ${
+            r.exchange.attempted
+              ? (r.exchange.success ? "✅ " : "❌ ") + (r.exchange.message || "未知结果")
+              : "⏭️ 跳过（" + (r.exchange.skippedReason || "未触发") + "）"
+          }
+        </div>
+      ` : "";
       return `
         <div class="account-item">
           <div class="flex items-center justify-between">
@@ -212,11 +485,17 @@ async function handleRequest(env) {
               ${r.success ? "✅" : "❌"} ${translateMessage(r.message)}
             </span>
           </div>
-          ${r.points ? `
+          ${(r.points !== undefined && r.points !== null) ? `
           <div class="text-sm text-gray-500 mt-1">
             当前积分: ${r.points}
           </div>
           ` : ""}
+          ${(r.leftDays !== undefined && r.leftDays !== null) ? `
+          <div class="text-sm text-gray-500 mt-1">
+            剩余天数: ${r.leftDays}
+          </div>
+          ` : ""}
+          ${exchangeHtml}
         </div>
       `;
     }).join("");
@@ -241,6 +520,7 @@ async function handleCheckin(env) {
   let notificationMessage = "📋 GLaDOS签到结果\n\n";
   const baseUrl = GLADOS_BASE_URL;
   const tokens = getCheckinTokens(env);
+  const exchangePlan = getExchangePlan(env);
 
   for (const cookie of cookies) {
     if (!cookie.trim()) continue;
@@ -283,23 +563,42 @@ async function handleCheckin(env) {
       if (!checkinData) {
         throw lastCheckinError || new Error("签到请求失败");
       }
-      const statusData = await fetchJson(`${baseUrl}/api/user/status`, { headers: headers });
+      let status = await fetchStatus(baseUrl, headers);
+      const accountId = await getAccountIdFromCookie(trimmedCookie);
+
+      let exchange = null;
+      if (exchangePlan) {
+        exchange = await maybeExchangePoints(env, baseUrl, headers, accountId, status);
+        if (exchange && exchange.afterStatus) {
+          status = exchange.afterStatus;
+        }
+      }
 
       // 3. 处理结果
       const result = {
-        email: statusData.data && statusData.data.email || "未知账号",
-        points: statusData.data && statusData.data.points,
+        email: status.email,
+        points: status.points,
+        leftDays: status.leftDays,
         success: isCheckinSuccess(checkinData),
         message: checkinData.message || checkinData.msg || "签到失败",
         baseUrl: baseUrl,
         token: usedToken,
-        time: new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+        time: nowChinaString(),
+        exchange: exchange
       };
       
       results.push(result);
       notificationMessage += `${result.success ? "✅" : "❌"} ${result.email}: ${translateMessage(result.message)}\n`;
-      if (result.points) {
-        notificationMessage += `   当前积分: ${result.points}\n`;
+      if (result.points !== undefined && result.points !== null) notificationMessage += `   当前积分: ${result.points}\n`;
+      if (result.leftDays !== undefined && result.leftDays !== null) {
+        notificationMessage += `   剩余天数: ${result.leftDays}\n`;
+      }
+      if (exchangePlan && result.exchange) {
+        if (!result.exchange.attempted) {
+          notificationMessage += `   积分兑换(${result.exchange.plan}): 跳过（${result.exchange.skippedReason || "未触发"}）\n`;
+        } else {
+          notificationMessage += `   积分兑换(${result.exchange.plan}): ${result.exchange.success ? "成功" : "失败"}（${result.exchange.message || "无返回"}）\n`;
+        }
       }
       notificationMessage += "\n";
 
@@ -309,7 +608,7 @@ async function handleCheckin(env) {
         email: "未知账号",
         success: false,
         message: errorMessage,
-        time: new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+        time: nowChinaString()
       };
       results.push(errorResult);
       notificationMessage += `❌ 未知账号: ${errorMessage}\n\n`;
@@ -319,7 +618,7 @@ async function handleCheckin(env) {
   // 保存结果
   await env.GLADOS_KV.put("results", JSON.stringify(results));
   await env.GLADOS_KV.put("lastCheck", 
-    new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+    nowChinaString()
   );
 
   // 发送Telegram通知
