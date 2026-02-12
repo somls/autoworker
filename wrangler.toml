@@ -1,0 +1,7 @@
+name = "gs"
+main = "worker.js"
+compatibility_date = "2026-02-04"
+
+[triggers]
+# UTC 1:30（北京时间 9:30）
+crons = ["30 1 * * *"]

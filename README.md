@@ -26,6 +26,10 @@
 
 ## 部署步骤
 
+### GitHub 自动构建/部署（Cloudflare 连接 GitHub）
+如果你在 Cloudflare 里配置了“连接 GitHub 自动部署”，并且 Deploy command 使用 `npx wrangler deploy`，
+仓库根目录需要提供 Wrangler 配置（例如 `wrangler.toml`）来告诉 Wrangler 入口文件（本项目为 `worker.js`）。
+
 ### 1. 创建 Worker
 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，创建一个新的 Worker，并将 `worker.js` 内容粘贴到脚本编辑器中。
 
