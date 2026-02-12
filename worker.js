@@ -305,6 +305,62 @@ async function fetchJson(url, init) {
   return data;
 }
 
+function isKvBound(env) {
+  return Boolean(
+    env &&
+      env.GLADOS_KV &&
+      typeof env.GLADOS_KV.get === "function" &&
+      typeof env.GLADOS_KV.put === "function"
+  );
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderMissingConfigPage(missingItems) {
+  const itemsHtml = missingItems
+    .map(function(item) {
+      return `<li><code>${escapeHtml(item)}</code></li>`;
+    })
+    .join("");
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Worker 配置缺失</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 0; padding: 24px; background: #f3f4f6; }
+    .card { max-width: 920px; margin: 0 auto; background: #fff; border-radius: 12px; padding: 20px 22px; box-shadow: 0 10px 15px rgba(0,0,0,.06); }
+    code { background: #111827; color: #f9fafb; padding: 2px 6px; border-radius: 6px; }
+    h1 { margin: 0 0 8px; font-size: 20px; }
+    p { margin: 10px 0; color: #374151; line-height: 1.6; }
+    ul, ol { margin: 10px 0 0 20px; color: #374151; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Worker 配置缺失</h1>
+    <p>当前部署缺少以下绑定/变量，页面无法读取 KV（因此会报错）。</p>
+    <ul>${itemsHtml}</ul>
+    <p><b>修复方法（推荐顺序）：</b></p>
+    <ol>
+      <li>Cloudflare Dashboard → Workers & Pages → 你的 Worker → Settings → <b>Bindings</b>：添加 KV Namespace 绑定 <code>GLADOS_KV</code></li>
+      <li>Settings → <b>Variables</b>：添加 Secret <code>GLADOS_COOKIE</code>（多账号用 <code>&amp;</code> 连接）</li>
+      <li>如果你使用 Git 自动部署：在 <code>wrangler.toml</code> 里声明 KV 绑定（否则每次 <code>wrangler deploy</code> 可能会把绑定“同步成空”）</li>
+    </ol>
+  </div>
+</body>
+</html>`;
+}
+
 const HTML_TEMPLATE = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -454,6 +510,16 @@ async function sendTelegramNotification(env, message) {
 }
 
 async function handleRequest(env) {
+  const missing = [];
+  if (!isKvBound(env)) missing.push("GLADOS_KV");
+  if (!env || !String(env.GLADOS_COOKIE || "").trim()) missing.push("GLADOS_COOKIE");
+  if (missing.length) {
+    return new Response(renderMissingConfigPage(missing), {
+      status: 500,
+      headers: { "Content-Type": "text/html;charset=UTF-8" }
+    });
+  }
+
   const stored = await env.GLADOS_KV.get("results");
   const results = stored ? JSON.parse(stored) : [];
   const lastCheck = await env.GLADOS_KV.get("lastCheck") || "尚未签到";
@@ -515,7 +581,38 @@ async function handleRequest(env) {
 }
 
 async function handleCheckin(env) {
-  const cookies = env.GLADOS_COOKIE.split("&");
+  if (!isKvBound(env)) {
+    return new Response(JSON.stringify({
+      success: false,
+      results: [{
+        email: "未配置",
+        success: false,
+        message: "缺少 KV 绑定：GLADOS_KV",
+        time: nowChinaString()
+      }]
+    }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const cookieRaw = String(env.GLADOS_COOKIE || "").trim();
+  if (!cookieRaw) {
+    return new Response(JSON.stringify({
+      success: false,
+      results: [{
+        email: "未配置",
+        success: false,
+        message: "缺少环境变量/Secret：GLADOS_COOKIE",
+        time: nowChinaString()
+      }]
+    }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const cookies = cookieRaw.split("&");
   const results = [];
   let notificationMessage = "📋 GLaDOS签到结果\n\n";
   const baseUrl = GLADOS_BASE_URL;

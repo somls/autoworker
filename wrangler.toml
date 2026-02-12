@@ -2,6 +2,16 @@ name = "gs"
 main = "worker.js"
 compatibility_date = "2026-02-04"
 
+kv_namespaces = [
+  { binding = "GLADOS_KV", id = "f213e5b0692140768d37ae9e350c0077" }
+]
+
+# 提示：如果你启用了“非生产分支构建/预览”，预览环境也会用到 KV。
+# 想隔离预览与生产的数据，可以再建一个 KV 命名空间并在这里加上 preview_id：
+# kv_namespaces = [
+#   { binding = "GLADOS_KV", id = "...生产ID...", preview_id = "...预览ID..." }
+# ]
+
 [triggers]
 # UTC 1:30（北京时间 9:30）
 crons = ["30 1 * * *"]
