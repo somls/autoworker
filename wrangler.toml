@@ -1,6 +1,7 @@
 name = "gs"
 main = "worker.js"
 compatibility_date = "2026-02-04"
+keep_vars = true
 
 kv_namespaces = [
   { binding = "GLADOS_KV", id = "f213e5b0692140768d37ae9e350c0077" }
