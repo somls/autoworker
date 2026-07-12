@@ -1,6 +1,9 @@
 // KV命名空间：GLADOS_KV
 // 必需环境变量：
-// - GLADOS_COOKIE：多个账号cookie用'&'分隔
+// - GLADOS_COOKIE：签到 Cookie（多账号用'&'分隔），自动应用到所有内置站点
+// 可选环境变量（多站点覆盖）：
+// - SITES：JSON数组覆盖内置站点列表，如 [{"name":"xxx","url":"https://xxx.com"}]
+// - SITES_COOKIES：JSON对象按站点分配不同 Cookie，如 {"glados":"cookie1","railgun":"cookie2"}
 // 可选环境变量（积分兑换）：
 // - GLADOS_EXCHANGE_PLAN：100/200/500；不填则不兑换
 // - GLADOS_EXCHANGE_COOLDOWN_HOURS：兑换冷却时间（小时），默认 240（10天）
@@ -10,7 +13,40 @@
 // - TELEGRAM_BOT_TOKEN
 // - TELEGRAM_CHAT_ID
 
-const GLADOS_BASE_URL = "https://glados.cloud";
+const DEFAULT_SITES = [
+  { name: "glados", url: "https://glados.cloud" },
+  { name: "railgun", url: "https://railgun.info" }
+];
+
+function parseSites(env) {
+  const sharedCookie = String(env.GLADOS_COOKIE || "").trim();
+  const sitesRaw = String(env.SITES || "").trim();
+
+  let arr = null;
+  if (sitesRaw) {
+    try {
+      const parsed = JSON.parse(sitesRaw);
+      if (Array.isArray(parsed) && parsed.length > 0) arr = parsed;
+    } catch {}
+  }
+  if (!arr) arr = DEFAULT_SITES;
+
+  let cookiesMap = {};
+  const cookiesRaw = String(env.SITES_COOKIES || "").trim();
+  if (cookiesRaw) {
+    try { cookiesMap = JSON.parse(cookiesRaw); } catch {}
+  }
+
+  return arr
+    .filter(function(s) { return s && s.url; })
+    .map(function(s, i) {
+      return {
+        name: s.name || ("site" + (i + 1)),
+        url: String(s.url).replace(/\/+$/, ""),
+        cookies: String(cookiesMap[s.name] || cookiesMap[String(s.url)] || sharedCookie).trim()
+      };
+    });
+}
 
 const EXCHANGE_PLANS = {
   100: { planType: "plan100", requiredPoints: 100, addedDays: 10 },
@@ -19,14 +55,42 @@ const EXCHANGE_PLANS = {
   500: { planType: "plan500", requiredPoints: 500, addedDays: 100 }
 };
 
-function getCheckinTokens(env) {
+async function autoDetectCheckinToken(baseUrl) {
+  try {
+    const res = await fetch(`${baseUrl}/console/checkin`, {
+      headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const patterns = [
+      /token\s*[:=]\s*["']([^"']+)["']/g,
+      /checkinToken\s*[:=]\s*["']([^"']+)["']/g,
+      /["']token["']\s*:\s*["']([^"']+)["']/g,
+    ];
+    for (const pattern of patterns) {
+      let match;
+      while ((match = pattern.exec(html)) !== null) {
+        const val = match[1].trim();
+        if (val && val.length < 100 && !val.includes(" ") && !val.includes("<")) {
+          return val;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function getCheckinTokens(env, site, detectedToken) {
   const configured = (env.GLADOS_CHECKIN_TOKEN || "").trim();
   const candidates = [
-    "glados.cloud",
+    detectedToken,
+    "",
     configured,
+    "glados.cloud",
     "glados.one",
     "glados_network",
-    "glados.network"
+    "glados.network",
+    "railgun.info"
   ];
   return candidates.filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
 }
@@ -366,7 +430,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>GLaDOS签到</title>
+  <title>签到管理</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@sweetalert2/theme-dark@4/dark.css">
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
@@ -383,7 +447,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 <body class="bg-gray-100 min-h-screen">
   <div class="container mx-auto px-4 py-8">
     <div class="bg-white rounded-lg shadow-lg p-6 mb-6">
-      <h1 class="text-2xl font-bold text-gray-800 mb-4">GLaDOS签到状态</h1>
+      <h1 class="text-2xl font-bold text-gray-800 mb-4">签到状态</h1>
       <div class="space-y-4">
         <div class="flex items-center justify-between">
           <span class="text-gray-600">上次签到:</span>
@@ -443,7 +507,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             let successMsg = "";
             data.results.forEach(function(item) {
               if (item.success) {
-                successMsg += item.email + ": " + translateMessage(item.message) + "<br>";
+                const siteTag = item.site ? ("[" + item.site + "] ") : "";
+                successMsg += siteTag + item.email + ": " + translateMessage(item.message) + "<br>";
               }
             });
             
@@ -457,7 +522,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           } else {
             let errorMsg = "";
             data.results.forEach(function(item) {
-              errorMsg += item.email + ": " + translateMessage(item.message) + "<br>";
+              const siteTag = item.site ? ("[" + item.site + "] ") : "";
+              errorMsg += siteTag + item.email + ": " + translateMessage(item.message) + "<br>";
             });
             
             await Swal.fire({
@@ -543,6 +609,9 @@ async function handleRequest(env) {
           }
         </div>
       ` : "";
+      const siteHtml = r.site ? `
+        <div class="text-xs text-blue-500 mt-1">${r.site}${r.baseUrl ? " (" + r.baseUrl + ")" : ""}</div>
+      ` : "";
       return `
         <div class="account-item">
           <div class="flex items-center justify-between">
@@ -551,6 +620,7 @@ async function handleRequest(env) {
               ${r.success ? "✅" : "❌"} ${translateMessage(r.message)}
             </span>
           </div>
+          ${siteHtml}
           ${(r.points !== undefined && r.points !== null) ? `
           <div class="text-sm text-gray-500 mt-1">
             当前积分: ${r.points}
@@ -596,8 +666,8 @@ async function handleCheckin(env) {
     });
   }
 
-  const cookieRaw = String(env.GLADOS_COOKIE || "").trim();
-  if (!cookieRaw) {
+  const sites = parseSites(env);
+  if (sites.length === 0) {
     return new Response(JSON.stringify({
       success: false,
       results: [{
@@ -612,120 +682,131 @@ async function handleCheckin(env) {
     });
   }
 
-  const cookies = cookieRaw.split("&");
-  const results = [];
-  let notificationMessage = "📋 GLaDOS签到结果\n\n";
-  const baseUrl = GLADOS_BASE_URL;
-  const tokens = getCheckinTokens(env);
+  const allResults = [];
+  let notificationMessage = "📋 签到结果\n\n";
   const exchangePlan = getExchangePlan(env);
 
-  for (const cookie of cookies) {
-    if (!cookie.trim()) continue;
-    
-    try {
-      const trimmedCookie = cookie.trim();
-      const headers = {
-        cookie: trimmedCookie,
-        "referer": `${baseUrl}/console/checkin`,
-        "origin": baseUrl,
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "content-type": "application/json;charset=UTF-8"
-      };
+  for (const site of sites) {
+    const baseUrl = site.url;
+    const siteName = site.name;
+    const cookieRaw = site.cookies;
 
-      let checkinData = null;
-      let usedToken = null;
-      let lastCheckinError = null;
+    notificationMessage += `🌐 ${siteName} (${baseUrl})\n`;
 
-      for (const token of tokens) {
-        try {
-          const data = await fetchJson(`${baseUrl}/api/user/checkin`, {
-            method: "POST",
-            headers: headers,
-            body: JSON.stringify({ token })
-          });
+    if (!cookieRaw) {
+      notificationMessage += `⚠️ 未配置 Cookie，跳过\n\n`;
+      continue;
+    }
 
-          if (!isCheckinSuccess(data)) {
-            const msg = (data && (data.message || data.msg)) || "签到失败";
-            throw new Error(msg);
+    const cookies = cookieRaw.split("&");
+    const detectedToken = await autoDetectCheckinToken(baseUrl);
+    const tokens = getCheckinTokens(env, site, detectedToken);
+
+    for (const cookie of cookies) {
+      if (!cookie.trim()) continue;
+
+      try {
+        const trimmedCookie = cookie.trim();
+        const headers = {
+          cookie: trimmedCookie,
+          "referer": `${baseUrl}/console/checkin`,
+          "origin": baseUrl,
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "content-type": "application/json;charset=UTF-8"
+        };
+
+        let checkinData = null;
+        let usedToken = null;
+        let lastCheckinError = null;
+
+        for (const token of tokens) {
+          try {
+            const data = await fetchJson(`${baseUrl}/api/user/checkin`, {
+              method: "POST",
+              headers: headers,
+              body: JSON.stringify({ token })
+            });
+
+            if (!isCheckinSuccess(data)) {
+              const msg = (data && (data.message || data.msg)) || "签到失败";
+              throw new Error(msg);
+            }
+
+            checkinData = data;
+            usedToken = token;
+            break;
+          } catch (e) {
+            lastCheckinError = e;
           }
-
-          checkinData = data;
-          usedToken = token;
-          break;
-        } catch (e) {
-          lastCheckinError = e;
         }
-      }
 
-      if (!checkinData) {
-        throw lastCheckinError || new Error("签到请求失败");
-      }
-      let status = await fetchStatus(baseUrl, headers);
-      const accountId = await getAccountIdFromCookie(trimmedCookie);
-
-      let exchange = null;
-      if (exchangePlan) {
-        exchange = await maybeExchangePoints(env, baseUrl, headers, accountId, status);
-        if (exchange && exchange.afterStatus) {
-          status = exchange.afterStatus;
+        if (!checkinData) {
+          throw lastCheckinError || new Error("签到请求失败");
         }
-      }
+        let status = await fetchStatus(baseUrl, headers);
+        const accountId = await getAccountIdFromCookie(trimmedCookie);
 
-      // 3. 处理结果
-      const result = {
-        email: status.email,
-        points: status.points,
-        leftDays: status.leftDays,
-        success: isCheckinSuccess(checkinData),
-        message: checkinData.message || checkinData.msg || "签到失败",
-        baseUrl: baseUrl,
-        token: usedToken,
-        time: nowChinaString(),
-        exchange: exchange
-      };
-      
-      results.push(result);
-      notificationMessage += `${result.success ? "✅" : "❌"} ${result.email}: ${translateMessage(result.message)}\n`;
-      if (result.points !== undefined && result.points !== null) notificationMessage += `   当前积分: ${result.points}\n`;
-      if (result.leftDays !== undefined && result.leftDays !== null) {
-        notificationMessage += `   剩余天数: ${result.leftDays}\n`;
-      }
-      if (exchangePlan && result.exchange) {
-        if (!result.exchange.attempted) {
-          notificationMessage += `   积分兑换(${result.exchange.plan}): 跳过（${result.exchange.skippedReason || "未触发"}）\n`;
-        } else {
-          notificationMessage += `   积分兑换(${result.exchange.plan}): ${result.exchange.success ? "成功" : "失败"}（${result.exchange.message || "无返回"}）\n`;
+        let exchange = null;
+        if (exchangePlan) {
+          exchange = await maybeExchangePoints(env, baseUrl, headers, accountId, status);
+          if (exchange && exchange.afterStatus) {
+            status = exchange.afterStatus;
+          }
         }
-      }
-      notificationMessage += "\n";
 
-    } catch (error) {
-      const errorMessage = (error && error.message) ? error.message : String(error);
-      const errorResult = {
-        email: "未知账号",
-        success: false,
-        message: errorMessage,
-        time: nowChinaString()
-      };
-      results.push(errorResult);
-      notificationMessage += `❌ 未知账号: ${errorMessage}\n\n`;
+        const result = {
+          site: siteName,
+          email: status.email,
+          points: status.points,
+          leftDays: status.leftDays,
+          success: isCheckinSuccess(checkinData),
+          message: checkinData.message || checkinData.msg || "签到失败",
+          baseUrl: baseUrl,
+          token: usedToken,
+          time: nowChinaString(),
+          exchange: exchange
+        };
+
+        allResults.push(result);
+        notificationMessage += `${result.success ? "✅" : "❌"} ${result.email}: ${translateMessage(result.message)}\n`;
+        if (result.points !== undefined && result.points !== null) notificationMessage += `   当前积分: ${result.points}\n`;
+        if (result.leftDays !== undefined && result.leftDays !== null) {
+          notificationMessage += `   剩余天数: ${result.leftDays}\n`;
+        }
+        if (exchangePlan && result.exchange) {
+          if (!result.exchange.attempted) {
+            notificationMessage += `   积分兑换(${result.exchange.plan}): 跳过（${result.exchange.skippedReason || "未触发"}）\n`;
+          } else {
+            notificationMessage += `   积分兑换(${result.exchange.plan}): ${result.exchange.success ? "成功" : "失败"}（${result.exchange.message || "无返回"}）\n`;
+          }
+        }
+        notificationMessage += "\n";
+
+      } catch (error) {
+        const errorMessage = (error && error.message) ? error.message : String(error);
+        const errorResult = {
+          site: siteName,
+          email: "未知账号",
+          success: false,
+          message: errorMessage,
+          time: nowChinaString()
+        };
+        allResults.push(errorResult);
+        notificationMessage += `❌ 未知账号: ${errorMessage}\n\n`;
+      }
     }
   }
 
-  // 保存结果
-  await env.GLADOS_KV.put("results", JSON.stringify(results));
-  await env.GLADOS_KV.put("lastCheck", 
-    nowChinaString()
-  );
+  await env.GLADOS_KV.put("results", JSON.stringify(allResults));
+  await env.GLADOS_KV.put("lastCheck", nowChinaString());
 
-  // 发送Telegram通知
   await sendTelegramNotification(env, notificationMessage);
 
   return new Response(JSON.stringify({
-    success: results.some(function(r) { return r.success; }),
-    results: results
+    success: allResults.some(function(r) { return r.success; }),
+    results: allResults
   }), {
-    headers: { 
+    headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "POST, OPTIONS",
