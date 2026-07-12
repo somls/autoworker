@@ -84,7 +84,6 @@ function getCheckinTokens(env, site, detectedToken) {
   const configured = (env.GLADOS_CHECKIN_TOKEN || "").trim();
   const candidates = [
     detectedToken,
-    "",
     configured,
     "glados.cloud",
     "glados.one",
@@ -99,6 +98,11 @@ function isCheckinSuccess(checkinData) {
   const msg = (checkinData && (checkinData.message || checkinData.msg)) || "";
   if (checkinData && checkinData.code === 0) return true;
   return typeof msg === "string" && msg.toLowerCase().includes("checkin");
+}
+
+function isAlreadyCheckedIn(checkinData) {
+  const msg = ((checkinData && (checkinData.message || checkinData.msg)) || "").toLowerCase();
+  return msg.includes("today") || msg.includes("already") || msg.includes("tomorrow") || msg.includes("repeat");
 }
 
 function parseBoolean(value, defaultValue) {
@@ -548,8 +552,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const points = msg.match(/\\d+/)?.[0] || "0";
         return "✅ 签到成功，获得 " + points + " 积分";
       }
+      if (msg.toLowerCase().includes("today") || msg.toLowerCase().includes("tomorrow")) return "⏰ 今日已签到";
       if (msg.includes("Checkin Repeats")) return "⏰ 今日已签到";
-      if (msg.includes("Please Checkin Tomorrow")) return "🔄 请明日再来";
+      if (msg.toLowerCase().includes("no permission") || msg.includes("没有权限")) return "❌ 无权限（Token 不匹配或 Cookie 过期）";
+      if (msg.toLowerCase().includes("please checkin via")) return "⚠️ 需要通过新站点签到";
       return msg;
     }
   </script>
@@ -715,9 +721,20 @@ async function handleCheckin(env) {
           "content-type": "application/json;charset=UTF-8"
         };
 
+        let email = "未知账号";
+        let points = null;
+        let leftDays = null;
+        try {
+          const statusData = await fetchStatus(baseUrl, headers);
+          email = statusData.email;
+          points = statusData.points;
+          leftDays = statusData.leftDays;
+        } catch {}
+
         let checkinData = null;
         let usedToken = null;
         let lastCheckinError = null;
+        let alreadyCheckedIn = false;
 
         for (const token of tokens) {
           try {
@@ -727,14 +744,21 @@ async function handleCheckin(env) {
               body: JSON.stringify({ token })
             });
 
-            if (!isCheckinSuccess(data)) {
-              const msg = (data && (data.message || data.msg)) || "签到失败";
-              throw new Error(msg);
+            if (isCheckinSuccess(data)) {
+              checkinData = data;
+              usedToken = token;
+              break;
             }
 
-            checkinData = data;
-            usedToken = token;
-            break;
+            if (isAlreadyCheckedIn(data)) {
+              checkinData = data;
+              usedToken = token;
+              alreadyCheckedIn = true;
+              break;
+            }
+
+            const msg = (data && (data.message || data.msg)) || "签到失败";
+            lastCheckinError = new Error(msg);
           } catch (e) {
             lastCheckinError = e;
           }
@@ -743,23 +767,25 @@ async function handleCheckin(env) {
         if (!checkinData) {
           throw lastCheckinError || new Error("签到请求失败");
         }
-        let status = await fetchStatus(baseUrl, headers);
+
         const accountId = await getAccountIdFromCookie(trimmedCookie);
+        let status = { email, points, leftDays };
 
         let exchange = null;
-        if (exchangePlan) {
+        if (exchangePlan && !alreadyCheckedIn) {
           exchange = await maybeExchangePoints(env, baseUrl, headers, accountId, status);
           if (exchange && exchange.afterStatus) {
             status = exchange.afterStatus;
           }
         }
 
+        const success = isCheckinSuccess(checkinData) || alreadyCheckedIn;
         const result = {
           site: siteName,
-          email: status.email,
+          email: status.email || email,
           points: status.points,
           leftDays: status.leftDays,
-          success: isCheckinSuccess(checkinData),
+          success: success,
           message: checkinData.message || checkinData.msg || "签到失败",
           baseUrl: baseUrl,
           token: usedToken,
@@ -786,13 +812,13 @@ async function handleCheckin(env) {
         const errorMessage = (error && error.message) ? error.message : String(error);
         const errorResult = {
           site: siteName,
-          email: "未知账号",
+          email: email || "未知账号",
           success: false,
           message: errorMessage,
           time: nowChinaString()
         };
         allResults.push(errorResult);
-        notificationMessage += `❌ 未知账号: ${errorMessage}\n\n`;
+        notificationMessage += `❌ ${errorResult.email}: ${errorMessage}\n\n`;
       }
     }
   }
@@ -821,8 +847,9 @@ function translateMessage(msg) {
     const points = msg.match(/\d+/)?.[0] || "0";
     return "✅ 签到成功，获得 " + points + " 积分";
   }
+  if (msg.toLowerCase().includes("today") || msg.toLowerCase().includes("tomorrow")) return "⏰ 今日已签到";
   if (msg.includes("Checkin Repeats")) return "⏰ 今日已签到";
-  if (msg.includes("Please Checkin Tomorrow")) return "🔄 请明日再来";
+  if (msg.toLowerCase().includes("no permission") || msg.includes("没有权限")) return "❌ 无权限（Token 不匹配或 Cookie 过期）";
   if (msg.toLowerCase().includes("please checkin via")) return "⚠️ 需要通过新站点签到（Cookie/Token 可能需要更新）";
   return msg;
 }
