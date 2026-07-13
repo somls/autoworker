@@ -84,6 +84,7 @@ function getCheckinTokens(env, site, detectedToken) {
   const configured = (env.GLADOS_CHECKIN_TOKEN || "").trim();
   const candidates = [
     detectedToken,
+    "",
     configured,
     "glados.cloud",
     "glados.one",
@@ -810,6 +811,7 @@ async function handleCheckin(env) {
 
       } catch (error) {
         const errorMessage = (error && error.message) ? error.message : String(error);
+        console.error(`[checkin error] site=${siteName} cookie=${trimmedCookie.slice(0, 20)}... token=${usedToken || "none"} msg=${errorMessage}`);
         const errorResult = {
           site: siteName,
           email: email || "未知账号",
