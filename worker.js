@@ -1,9 +1,11 @@
 // KV命名空间：GLADOS_KV
 // 必需环境变量：
-// - GLADOS_COOKIE：签到 Cookie（多账号用'&'分隔），自动应用到所有内置站点
+// - GLADOS_COOKIE：签到 Cookie（多账号用'&'分隔），作为默认 Cookie
+// - RAILGUN_COOKIE：Railgun 站点专用 Cookie（多账号用'&'分隔）
+//   命名规则：{站点名大写}_COOKIE，如站点名为 xxx 则为 XXX_COOKIE
 // 可选环境变量（多站点覆盖）：
 // - SITES：JSON数组覆盖内置站点列表，如 [{"name":"xxx","url":"https://xxx.com"}]
-// - SITES_COOKIES：JSON对象按站点分配不同 Cookie，如 {"glados":"cookie1","railgun":"cookie2"}
+// - SITES_COOKIES：JSON对象按站点分配不同 Cookie（优先级最高），如 {"glados":"cookie1","railgun":"cookie2"}
 // 可选环境变量（积分兑换）：
 // - GLADOS_EXCHANGE_PLAN：100/200/500；不填则不兑换
 // - GLADOS_EXCHANGE_COOLDOWN_HOURS：兑换冷却时间（小时），默认 240（10天）
@@ -43,7 +45,7 @@ function parseSites(env) {
       return {
         name: s.name || ("site" + (i + 1)),
         url: String(s.url).replace(/\/+$/, ""),
-        cookies: String(cookiesMap[s.name] || cookiesMap[String(s.url)] || sharedCookie).trim()
+        cookies: String(cookiesMap[s.name] || cookiesMap[String(s.url)] || env[((s.name || "").toUpperCase() + "_COOKIE")] || sharedCookie).trim()
       };
     });
 }
@@ -82,23 +84,17 @@ async function autoDetectCheckinToken(baseUrl) {
 
 function getCheckinTokens(env, site, detectedToken) {
   const configured = (env.GLADOS_CHECKIN_TOKEN || "").trim();
-  const candidates = [
-    detectedToken,
-    "",
-    configured,
-    "glados.cloud",
-    "glados.one",
-    "glados_network",
-    "glados.network",
-    "railgun.info"
-  ];
+  // ponytail: 只保留高命中候选，减少子请求；不够再加
+  const candidates = [detectedToken, "", configured, "glados.network"];
   return candidates.filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
 }
 
 function isCheckinSuccess(checkinData) {
-  const msg = (checkinData && (checkinData.message || checkinData.msg)) || "";
-  if (checkinData && checkinData.code === 0) return true;
-  return typeof msg === "string" && msg.toLowerCase().includes("checkin");
+  if (!checkinData) return false;
+  if (checkinData.code === 0) return true;
+  const msg = String(checkinData.message || checkinData.msg || "").toLowerCase();
+  // "Checkin! Got N Points" / "Checkin Repeats" / "Today's observation logged" 都算成功
+  return msg.includes("checkin") || msg.includes("observation") || msg.includes("return tomorrow");
 }
 
 function parseBoolean(value, defaultValue) {
@@ -354,19 +350,15 @@ async function maybeExchangePoints(env, baseUrl, headers, accountId, beforeStatu
 }
 
 async function fetchJson(url, init) {
-  const res = await fetch(url, init);
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
+  const res = await fetchJsonSafe(url, init);
+  if (res.data === null && res.text) {
     throw new Error(`接口返回非JSON: ${url} (HTTP ${res.status})`);
   }
   if (!res.ok) {
-    const msg = data && (data.message || data.msg);
+    const msg = res.data && (res.data.message || res.data.msg);
     throw new Error(msg ? `HTTP ${res.status}: ${msg}` : `HTTP ${res.status}`);
   }
-  return data;
+  return res.data;
 }
 
 function isKvBound(env) {
@@ -545,11 +537,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     function translateMessage(msg) {
       if (!msg) return "未知状态";
       if (msg.includes("Got") && msg.includes("Points")) {
-        const points = msg.match(/\\d+/)?.[0] || "0";
+        const points = msg.match(/\d+/)?.[0] || "0";
         return "✅ 签到成功，获得 " + points + " 积分";
       }
       if (msg.includes("Checkin Repeats")) return "⏰ 今日已签到";
-      if (msg.includes("Please Checkin Tomorrow")) return "🔄 请明日再来";
+      if (msg.includes("observation logged")) return "⏰ 今日已签到";
+      if (msg.includes("Please Checkin Tomorrow") || msg.includes("Return tomorrow")) return "🔄 请明日再来";
+      if (msg.toLowerCase().includes("please checkin via")) return "⚠️ Cookie/Token 需要更新";
+      if (msg.includes("No permission") || msg.includes("没有权限")) return "🔒 无权限（Cookie 可能过期）";
       return msg;
     }
   </script>
@@ -578,7 +573,7 @@ async function sendTelegramNotification(env, message) {
 async function handleRequest(env) {
   const missing = [];
   if (!isKvBound(env)) missing.push("GLADOS_KV");
-  if (!env || !String(env.GLADOS_COOKIE || "").trim()) missing.push("GLADOS_COOKIE");
+  if (!env || !parseSites(env).some(function(s) { return s.cookies; })) missing.push("GLADOS_COOKIE 或站点 Cookie");
   if (missing.length) {
     return new Response(renderMissingConfigPage(missing), {
       status: 500,
@@ -784,15 +779,21 @@ async function handleCheckin(env) {
 
       } catch (error) {
         const errorMessage = (error && error.message) ? error.message : String(error);
+        // 尝试用 cookie 前 8 位做标识，避免全部显示"未知账号"
+        let label = "未知账号";
+        try {
+          const id = await getAccountIdFromCookie(cookie.trim());
+          label = "账号#" + id.slice(0, 6);
+        } catch {}
         const errorResult = {
           site: siteName,
-          email: "未知账号",
+          email: label,
           success: false,
           message: errorMessage,
           time: nowChinaString()
         };
         allResults.push(errorResult);
-        notificationMessage += `❌ 未知账号: ${errorMessage}\n\n`;
+        notificationMessage += `❌ ${label}: ${errorMessage}\n\n`;
       }
     }
   }
@@ -822,8 +823,10 @@ function translateMessage(msg) {
     return "✅ 签到成功，获得 " + points + " 积分";
   }
   if (msg.includes("Checkin Repeats")) return "⏰ 今日已签到";
-  if (msg.includes("Please Checkin Tomorrow")) return "🔄 请明日再来";
-  if (msg.toLowerCase().includes("please checkin via")) return "⚠️ 需要通过新站点签到（Cookie/Token 可能需要更新）";
+  if (msg.includes("observation logged")) return "⏰ 今日已签到";
+  if (msg.includes("Please Checkin Tomorrow") || msg.includes("Return tomorrow")) return "🔄 请明日再来";
+  if (msg.toLowerCase().includes("please checkin via")) return "⚠️ Cookie/Token 需要更新";
+  if (msg.includes("No permission") || msg.includes("没有权限")) return "🔒 无权限（Cookie 可能过期）";
   return msg;
 }
 
