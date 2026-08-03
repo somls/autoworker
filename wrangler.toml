@@ -3,14 +3,11 @@ main = "worker.js"
 compatibility_date = "2026-02-04"
 keep_vars = true
 
-kv_namespaces = [
-  { binding = "GLADOS_KV", id = "f213e5b0692140768d37ae9e350c0077" }
-]
-
-# 提示：如果你启用了“非生产分支构建/预览”，预览环境也会用到 KV。
-# 想隔离预览与生产的数据，可以再建一个 KV 命名空间并在这里加上 preview_id：
+# KV 绑定：部署后在 Cloudflare Dashboard → Worker → Settings → Bindings 中
+# 添加 KV Namespace，变量名设为 GLADOS_KV
+# 如果用 wrangler CLI 部署，取消下面注释并填入你自己账号的 KV ID：
 # kv_namespaces = [
-#   { binding = "GLADOS_KV", id = "...生产ID...", preview_id = "...预览ID..." }
+#   { binding = "GLADOS_KV", id = "你的KV命名空间ID" }
 # ]
 
 [triggers]
